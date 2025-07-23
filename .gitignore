@@ -1,0 +1,12 @@
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# Sensitive files
+.env
+*.log
+
+# IDE files
+.vscode/
+.idea/
