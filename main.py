@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from jose import JWTError, jwt
@@ -9,6 +9,10 @@ import sqlalchemy as sa
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+import os
+import pytesseract
+from PIL import Image
+import uuid
 
 # FastAPI app
 app = FastAPI()
@@ -20,7 +24,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # JWT configuration
-SECRET_KEY = "a7270d8708d0f54bad1ad18c7d6a2a6ed7bdff4e5e6210dfc4396fcc3d794902"
+SECRET_KEY = "your-secret-key"  # Change this in production!
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -30,16 +34,29 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # OAuth2 scheme
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-# SQLAlchemy User model
+# File upload directory
+UPLOAD_DIR = "uploads"
+if not os.path.exists(UPLOAD_DIR):
+    os.makedirs(UPLOAD_DIR)
+
+# SQLAlchemy Models
 class User(Base):
     __tablename__ = "users"
     id = sa.Column(sa.Integer, primary_key=True, index=True)
     username = sa.Column(sa.String(50), unique=True, index=True)
     hashed_password = sa.Column(sa.String(255))
 
+class ImageModel(Base):  # Renamed from Image to ImageModel
+    __tablename__ = "images"
+    id = sa.Column(sa.Integer, primary_key=True, index=True)
+    user_id = sa.Column(sa.Integer, sa.ForeignKey("users.id"), index=True)
+    filename = sa.Column(sa.String(255))
+    upload_date = sa.Column(sa.DateTime, default=datetime.utcnow)
+    extracted_text = sa.Column(sa.Text)
+
 Base.metadata.create_all(bind=engine)
 
-# Pydantic schemas
+# Pydantic Schemas
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -49,11 +66,20 @@ class UserOut(BaseModel):
     username: str
 
     class Config:
-        from_attributes = True  # Updated from orm_mode
+        from_attributes = True
 
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+class ImageOut(BaseModel):
+    id: int
+    filename: str
+    upload_date: datetime
+    extracted_text: str
+
+    class Config:
+        from_attributes = True
 
 # Dependency to get DB session
 def get_db():
@@ -97,6 +123,15 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         raise credentials_exception
     return user
 
+# Extract text from image
+def extract_text_from_image(image_path: str) -> str:
+    try:
+        image = Image.open(image_path)  # Uses PIL.Image.open
+        text = pytesseract.image_to_string(image)
+        return text.strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Text extraction failed: {str(e)}")
+
 # API Endpoints
 @app.post("/register", response_model=UserOut)
 def register(user: UserCreate, db: Session = Depends(get_db)):
@@ -125,3 +160,36 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
 @app.get("/users/me", response_model=UserOut)
 async def read_users_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+@app.post("/upload-image", response_model=ImageOut)
+async def upload_image(file: UploadFile = File(...), current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    # Validate file type
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image files are allowed")
+
+    # Generate unique filename
+    file_extension = file.filename.split(".")[-1]
+    unique_filename = f"{uuid.uuid4()}.{file_extension}"
+    file_path = os.path.join(UPLOAD_DIR, unique_filename)
+
+    # Save file
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+
+    # Extract text
+    extracted_text = extract_text_from_image(file_path)
+
+    # Save metadata to database
+    db_image = ImageModel(  # Updated to ImageModel
+        user_id=current_user.id,
+        filename=unique_filename,
+        extracted_text=extracted_text
+    )
+    db.add(db_image)
+    db.commit()
+    db.refresh(db_image)
+
+    return db_image
